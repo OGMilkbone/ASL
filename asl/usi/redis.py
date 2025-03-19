@@ -3,20 +3,12 @@ Redis-based Universal Schema Index implementation.
 """
 
 import json
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 import redis
 from pydantic import BaseModel
 
 from ..core.delta import SchemaDelta
-
-
-class SchemaMetadata(BaseModel):
-    """Metadata about a schema version."""
-    created_at: float
-    created_by: str
-    description: Optional[str] = None
-    tags: List[str] = []
-    is_deprecated: bool = False
+from ..core.metadata import SchemaMetadata
 
 
 class RedisUSI:
@@ -49,11 +41,11 @@ class RedisUSI:
         schema_name: str,
         version: str,
         delta: SchemaDelta,
-        metadata: Optional[SchemaMetadata] = None
+        metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """
         Register a new schema version with its delta and metadata.
-        
+
         Args:
             schema_name: Name of the schema
             version: Version identifier
@@ -62,103 +54,125 @@ class RedisUSI:
         """
         # Store the delta
         delta_key = self._get_key("delta", schema_name, version)
-        self.redis.set(delta_key, delta.json())
-        
+        self.redis.set(delta_key, delta.model_dump_json())
+
         # Store metadata
         if metadata:
             meta_key = self._get_key("meta", schema_name, version)
-            self.redis.set(meta_key, metadata.json())
-            
-        # Add to version set
+            meta_obj = SchemaMetadata(**metadata)
+            self.redis.set(meta_key, meta_obj.model_dump_json())
+
+        # Add version to the set of versions
         versions_key = self._get_key("versions", schema_name)
         self.redis.sadd(versions_key, version)
-        
+
         # Update compatibility matrix
         self._update_compatibility_matrix(schema_name, version)
-        
+
     def get_delta(self, schema_name: str, version: str) -> Optional[SchemaDelta]:
         """
-        Retrieve a schema delta.
-        
+        Get a schema delta by name and version.
+
         Args:
             schema_name: Name of the schema
             version: Version identifier
-            
+
         Returns:
             SchemaDelta object if found, None otherwise
         """
         delta_key = self._get_key("delta", schema_name, version)
         delta_json = self.redis.get(delta_key)
-        if delta_json:
-            return SchemaDelta.parse_raw(delta_json)
-        return None
-        
-    def get_metadata(self, schema_name: str, version: str) -> Optional[SchemaMetadata]:
+        if not delta_json:
+            return None
+        return SchemaDelta.model_validate_json(delta_json.decode())
+
+    def get_metadata(self, schema_name: str, version: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieve schema metadata.
-        
+        Get schema metadata by name and version.
+
         Args:
             schema_name: Name of the schema
             version: Version identifier
-            
+
         Returns:
-            SchemaMetadata object if found, None otherwise
+            Metadata dictionary if found, None otherwise
         """
         meta_key = self._get_key("meta", schema_name, version)
         meta_json = self.redis.get(meta_key)
-        if meta_json:
-            return SchemaMetadata.parse_raw(meta_json)
-        return None
-        
-    def get_versions(self, schema_name: str) -> Set[str]:
+        if not meta_json:
+            return None
+        return SchemaMetadata.model_validate_json(meta_json.decode()).model_dump()
+
+    def get_versions(self, schema_name: str) -> List[str]:
         """
         Get all versions for a schema.
-        
+
         Args:
             schema_name: Name of the schema
-            
+
         Returns:
-            Set of version identifiers
+            List of version identifiers
         """
         versions_key = self._get_key("versions", schema_name)
-        return {v.decode() for v in self.redis.smembers(versions_key)}
-        
+        versions = self.redis.smembers(versions_key)
+        return sorted([v.decode() for v in versions])
+
     def is_compatible(self, schema_name: str, version1: str, version2: str) -> bool:
         """
         Check if two schema versions are compatible.
-        
+
         Args:
             schema_name: Name of the schema
             version1: First version
             version2: Second version
-            
+
         Returns:
-            True if versions are compatible, False otherwise
+            True if compatible, False otherwise
         """
-        compat_key = self._get_key("compat", schema_name, f"{version1}:{version2}")
-        return bool(self.redis.get(compat_key))
+        # Get the deltas
+        delta1 = self.get_delta(schema_name, version1)
+        delta2 = self.get_delta(schema_name, version2)
+        if not delta1 or not delta2:
+            return False
+
+        # Check compatibility
+        # For now, we'll say they're compatible if we can transform data between them
+        try:
+            chain = self.get_delta_chain(schema_name, version1, version2)
+            return bool(chain)
+        except Exception:
+            return False
+
+    def get_compatibility_matrix(self, schema_name: str) -> Dict[str, Dict[str, bool]]:
+        """
+        Get the compatibility matrix for a schema.
+
+        Args:
+            schema_name: Name of the schema
+
+        Returns:
+            Dictionary mapping version pairs to compatibility status
+        """
+        matrix_key = self._get_key("matrix", schema_name)
+        matrix_json = self.redis.get(matrix_key)
+        if matrix_json:
+            return json.loads(matrix_json.decode())
         
-    def _update_compatibility_matrix(self, schema_name: str, new_version: str) -> None:
-        """Update the compatibility matrix when a new version is registered."""
+        # If no matrix exists, create one
         versions = self.get_versions(schema_name)
+        matrix = {}
+        for v1 in versions:
+            matrix[v1] = {}
+            for v2 in versions:
+                if v1 == v2:
+                    matrix[v1][v2] = True
+                else:
+                    matrix[v1][v2] = self.is_compatible(schema_name, v1, v2)
         
-        # A version is always compatible with itself
-        compat_key = self._get_key("compat", schema_name, f"{new_version}:{new_version}")
-        self.redis.set(compat_key, "1")
-        
-        # Get the previous version (assuming versions are ordered)
-        versions_list = sorted(list(versions))
-        if len(versions_list) > 1:
-            prev_version = versions_list[-2]  # Second to last version
-            
-            # New version is compatible with previous version
-            compat_key = self._get_key("compat", schema_name, f"{prev_version}:{new_version}")
-            self.redis.set(compat_key, "1")
-            
-            # Previous version is compatible with new version (backward compatibility)
-            compat_key = self._get_key("compat", schema_name, f"{new_version}:{prev_version}")
-            self.redis.set(compat_key, "1")
-            
+        # Store the matrix
+        self.redis.set(matrix_key, json.dumps(matrix))
+        return matrix
+
     def get_delta_chain(
         self,
         schema_name: str,
@@ -166,31 +180,56 @@ class RedisUSI:
         to_version: str
     ) -> List[SchemaDelta]:
         """
-        Get the chain of deltas needed to transform between two versions.
-        
+        Get the chain of deltas needed to transform data from one version to another.
+
         Args:
             schema_name: Name of the schema
             from_version: Source version
             to_version: Target version
-            
+
         Returns:
             List of SchemaDelta objects
         """
-        versions = sorted(list(self.get_versions(schema_name)))
-        from_idx = versions.index(from_version)
-        to_idx = versions.index(to_version)
+        # For now, we'll just return a direct path if both versions exist
+        if from_version == to_version:
+            return []
+
+        # Get the deltas
+        delta1 = self.get_delta(schema_name, from_version)
+        delta2 = self.get_delta(schema_name, to_version)
+        if not delta1 or not delta2:
+            raise ValueError(f"One or both versions not found: {from_version}, {to_version}")
+
+        # Return the direct path
+        return [delta2]
+
+    def _update_compatibility_matrix(self, schema_name: str, new_version: str) -> None:
+        """Update the compatibility matrix when a new version is added."""
+        # Get all versions
+        versions = self.get_versions(schema_name)
         
-        if from_idx < to_idx:
-            # Forward transformation
-            return [
-                self.get_delta(schema_name, v)
-                for v in versions[from_idx + 1:to_idx + 1]
-                if self.get_delta(schema_name, v)
-            ]
-        else:
-            # Backward transformation
-            return [
-                self.get_delta(schema_name, v)
-                for v in reversed(versions[to_idx + 1:from_idx + 1])
-                if self.get_delta(schema_name, v)
-            ] 
+        # Initialize matrix for new version
+        matrix_key = self._get_key("matrix", schema_name)
+        matrix = {}
+        matrix_json = self.redis.get(matrix_key)
+        if matrix_json:
+            matrix = json.loads(matrix_json.decode())
+        
+        # Initialize matrix for all versions
+        for version in versions:
+            if version not in matrix:
+                matrix[version] = {}
+        
+        # Version is compatible with itself
+        matrix[new_version][new_version] = True
+        
+        # Check compatibility with all other versions
+        for version in versions:
+            if version != new_version:
+                # Previous versions are compatible with new version
+                matrix[version][new_version] = True
+                # New version is not compatible with previous versions
+                matrix[new_version][version] = False
+        
+        # Store updated matrix
+        self.redis.set(matrix_key, json.dumps(matrix)) 

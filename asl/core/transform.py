@@ -8,121 +8,110 @@ from datetime import datetime
 
 
 class SchemaTransformer:
-    """
-    Handles the transformation of data between different schema versions.
-    """
+    """Handles schema transformations and data conversions."""
     
     def __init__(self):
-        self._cache: Dict[str, Any] = {}
+        self._transform_cache: Dict[str, Any] = {}
         
-    def transform(
-        self,
-        data: Dict,
-        transformation: str,
-        context: Optional[Dict] = None
-    ) -> Any:
-        """
-        Transform data according to a transformation rule.
+    def transform_data(self, data: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Transform data according to the schema's transformation rules."""
+        transformed_data = data.copy()
         
-        Args:
-            data: Data to transform
-            transformation: Transformation rule as a string expression
-            context: Optional context data for the transformation
-            
-        Returns:
-            Transformed data
-        """
+        for field, field_schema in schema.items():
+            if "transform" in field_schema:
+                transform_rule = field_schema["transform"]
+                if field in transformed_data:
+                    transformed_data[field] = self._apply_transform(
+                        transformed_data[field],
+                        transform_rule
+                    )
+                    
+        return transformed_data
+        
+    def _apply_transform(self, value: Any, transform_rule: str) -> Any:
+        """Apply a transformation rule to a value."""
         # Check cache first
-        cache_key = f"{str(data)}:{transformation}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        cache_key = f"{value}:{transform_rule}"
+        if cache_key in self._transform_cache:
+            return self._transform_cache[cache_key]
             
-        # Prepare context for transformation
-        ctx = {
-            "data": data,
-            "datetime": datetime,
-            **(context or {})
-        }
-        
-        # Parse and execute transformation
-        try:
-            # Basic field access
-            if "." in transformation:
-                parts = transformation.split(".")
-                value = data
-                for part in parts:
-                    value = value[part]
+        # Parse the transformation rule
+        if transform_rule.startswith("split"):
+            # Handle split transformation
+            match = re.match(r"split\((.*?),\s*['\"](.*?)['\"]\)\[(\d+)\]", transform_rule)
+            if match:
+                field, delimiter, index = match.groups()
+                parts = value.split(delimiter)
+                if len(parts) > int(index):
+                    result = parts[int(index)]
+                else:
+                    result = value
+            else:
                 result = value
-            # Function calls
-            elif "(" in transformation:
-                func_name = transformation.split("(")[0]
-                args = self._parse_args(transformation)
-                result = self._execute_function(func_name, args, ctx)
-            # Simple field access
-            else:
-                result = data[transformation]
                 
-            # Cache the result
-            self._cache[cache_key] = result
-            return result
-            
-        except Exception as e:
-            raise ValueError(f"Transformation failed: {str(e)}")
-            
-    def _parse_args(self, transformation: str) -> list:
-        """Parse function arguments from a transformation string."""
-        # Extract arguments between parentheses
-        args_str = transformation[transformation.find("(")+1:transformation.rfind(")")]
-        if not args_str:
-            return []
-            
-        # Split arguments and evaluate each one
-        args = []
-        current = ""
-        in_quotes = False
-        
-        for char in args_str:
-            if char == '"' and not in_quotes:
-                in_quotes = True
-            elif char == '"' and in_quotes:
-                in_quotes = False
-            elif char == "," and not in_quotes:
-                args.append(current.strip())
-                current = ""
+        elif transform_rule.startswith("concat"):
+            # Handle concatenation transformation
+            match = re.match(r"concat\((.*?)\)", transform_rule)
+            if match:
+                fields = [f.strip().strip("'\"") for f in match.group(1).split(",")]
+                result = "".join(str(value.get(f, "")) for f in fields)
             else:
-                current += char
+                result = value
                 
-        if current:
-            args.append(current.strip())
-            
-        return args
-        
-    def _execute_function(self, func_name: str, args: list, context: Dict) -> Any:
-        """Execute a transformation function with the given arguments."""
-        # Built-in functions
-        if func_name == "split":
-            if len(args) != 2:
-                raise ValueError("split() requires exactly 2 arguments")
-            text = self.transform(context["data"], args[0], context)
-            delimiter = args[1].strip('"')
-            return text.split(delimiter)
-            
-        elif func_name == "concat":
-            if len(args) < 2:
-                raise ValueError("concat() requires at least 2 arguments")
-            parts = [self.transform(context["data"], arg, context) for arg in args]
-            return "".join(str(part) for part in parts)
-            
-        elif func_name == "format_date":
-            if len(args) != 2:
-                raise ValueError("format_date() requires exactly 2 arguments")
-            date = self.transform(context["data"], args[0], context)
-            format_str = args[1].strip('"')
-            return datetime.strptime(date, format_str)
-            
+        elif transform_rule.startswith("date_format"):
+            # Handle date format transformation
+            match = re.match(r"date_format\((.*?),\s*['\"](.*?)['\"]\)", transform_rule)
+            if match:
+                field, format_str = match.groups()
+                try:
+                    date = datetime.fromisoformat(value)
+                    result = date.strftime(format_str)
+                except (ValueError, TypeError):
+                    result = value
+            else:
+                result = value
+                
         else:
-            raise ValueError(f"Unknown function: {func_name}")
+            # Unknown transformation rule
+            result = value
             
+        # Cache the result
+        self._transform_cache[cache_key] = result
+        return result
+        
     def clear_cache(self) -> None:
         """Clear the transformation cache."""
-        self._cache.clear() 
+        self._transform_cache.clear()
+        
+    def validate_data(self, data: Dict[str, Any], schema: Dict[str, Any]) -> bool:
+        """Validate data against a schema."""
+        for field, field_schema in schema.items():
+            if field not in data:
+                if "required" in field_schema and field_schema["required"]:
+                    return False
+                continue
+                
+            field_type = field_schema.get("type", "string")
+            value = data[field]
+            
+            if not self._validate_type(value, field_type):
+                return False
+                
+        return True
+        
+    def _validate_type(self, value: Any, expected_type: str) -> bool:
+        """Validate a value against an expected type."""
+        type_validators = {
+            "string": lambda x: isinstance(x, str),
+            "integer": lambda x: isinstance(x, int),
+            "float": lambda x: isinstance(x, (int, float)),
+            "boolean": lambda x: isinstance(x, bool),
+            "datetime": lambda x: isinstance(x, (str, datetime)),
+            "array": lambda x: isinstance(x, list),
+            "object": lambda x: isinstance(x, dict)
+        }
+        
+        validator = type_validators.get(expected_type)
+        if validator:
+            return validator(value)
+        return True 

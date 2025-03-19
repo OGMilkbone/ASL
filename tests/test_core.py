@@ -1,99 +1,116 @@
 """
-Tests for the core ASL functionality.
+Tests for core functionality.
 """
 
 import pytest
 from asl.core.registry import SchemaRegistry
 from asl.core.delta import SchemaDelta
-from asl.core.transform import SchemaTransformer
+from asl.core.transformer import SchemaTransformer
+from asl.core.metadata import SchemaMetadata
+from datetime import datetime
 
 
 def test_schema_delta():
-    """Test basic schema delta functionality."""
+    """Test schema delta functionality."""
+    # Create a schema delta
     delta = SchemaDelta(
-        added=["firstName", "lastName"],
-        removed=["name"],
-        transformations={
-            "firstName": "split(name, ' ')[0]",
-            "lastName": "split(name, ' ')[1]"
-        }
+        added_fields={"email": "string"},
+        removed_fields={"firstName": "string"},
+        transformations={"email": "firstName"}
     )
     
-    # Test applying delta
-    data = {"userId": 123, "name": "John Doe"}
+    # Test applying the delta
+    data = {"firstName": "John Doe"}
     result = delta.apply(data)
+    assert "firstName" not in result
+    assert result["email"] == "John Doe"
     
-    assert "name" not in result
-    assert result["firstName"] == "John"
-    assert result["lastName"] == "Doe"
-    assert result["userId"] == 123
-    
-    # Test reversing delta
-    reversed_data = delta.reverse(result)
-    assert "name" in reversed_data
-    assert reversed_data["name"] is None
-    assert "firstName" not in reversed_data
-    assert "lastName" not in reversed_data
+    # Test reversing the delta
+    reverse_delta = delta.reverse()
+    assert reverse_delta.added_fields == {"firstName": "string"}
+    assert reverse_delta.removed_fields == {"email": "string"}
+    assert reverse_delta.transformations == {"firstName": "email"}
 
 
 def test_schema_registry():
     """Test schema registry functionality."""
     registry = SchemaRegistry()
     
-    # Create and register deltas
+    # Register initial schema
     delta1 = SchemaDelta(
-        added=["firstName", "lastName"],
-        removed=["name"],
-        transformations={
-            "firstName": "split(name, ' ')[0]",
-            "lastName": "split(name, ' ')[1]"
-        }
+        added_fields={"name": "string"},
+        removed_fields={},
+        transformations={}
     )
+    metadata1 = SchemaMetadata(
+        created_at=datetime.now().timestamp(),
+        created_by="test",
+        description="Initial schema",
+        tags=["v1"]
+    )
+    registry.register_delta("user", "v1", delta1, metadata1.model_dump())
     
+    # Register second version
     delta2 = SchemaDelta(
-        added=["email"],
-        transformations={
-            "email": "concat(firstName, '.', lastName, '@example.com')"
-        }
+        added_fields={"email": "string"},
+        removed_fields={"name": "string"},
+        transformations={"email": "name"}
     )
+    metadata2 = SchemaMetadata(
+        created_at=datetime.now().timestamp(),
+        created_by="test",
+        description="Add email field",
+        tags=["v2"]
+    )
+    registry.register_delta("user", "v2", delta2, metadata2.model_dump())
     
-    registry.register_delta("user", "v1", delta1)
-    registry.register_delta("user", "v2", delta2, "v1")
-    
-    # Test version management
+    # Test version retrieval
     versions = registry.get_versions("user")
-    assert len(versions) == 2
-    assert "v1" in versions
-    assert "v2" in versions
+    assert versions == ["v1", "v2"]
+    
+    # Test schema retrieval
+    delta, metadata = registry.get_schema("user", "v2")
+    assert delta == delta2
+    assert metadata["created_by"] == "test"
+    assert metadata["description"] == "Add email field"
+    
+    # Test compatibility checking
+    assert registry.check_compatibility("user", "v1", "v2")
     
     # Test data transformation
-    data = {"userId": 123, "name": "John Doe"}
-    result = registry.transform_data("user", data, "v0", "v2")
-    
-    assert result["firstName"] == "John"
-    assert result["lastName"] == "Doe"
-    assert result["email"] == "John.Doe@example.com"
-    assert result["userId"] == 123
+    data = {"name": "John Doe"}
+    result = registry.transform_data("user", data, "v1", "v2")
+    assert result == {"email": "John Doe"}
 
 
 def test_schema_transformer():
     """Test schema transformer functionality."""
-    transformer = SchemaTransformer()
+    registry = SchemaRegistry()
+    transformer = SchemaTransformer(registry)
     
     # Test basic field access
     data = {"user": {"name": "John Doe"}}
     result = transformer.transform(data, "user.name")
     assert result == "John Doe"
     
-    # Test function calls
-    result = transformer.transform(data, "split(user.name, ' ')")
-    assert result == ["John", "Doe"]
+    # Test nested field access
+    data = {"user": {"address": {"street": "123 Main St"}}}
+    result = transformer.transform(data, "user.address.street")
+    assert result == "123 Main St"
     
-    # Test concat function
-    result = transformer.transform(data, "concat(user.name, ' is awesome')")
-    assert result == "John Doe is awesome"
+    # Test missing field
+    result = transformer.transform(data, "user.email")
+    assert result is None
     
-    # Test caching
-    result1 = transformer.transform(data, "user.name")
-    result2 = transformer.transform(data, "user.name")
-    assert result1 == result2 
+    # Test invalid path
+    result = transformer.transform(data, "user.address.invalid.field")
+    assert result is None
+    
+    # Test empty path
+    result = transformer.transform(data, "")
+    assert result is None
+    
+    # Test non-dictionary value
+    data = {"value": 42}
+    result = transformer.transform(data, "value.invalid")
+    assert result is None 

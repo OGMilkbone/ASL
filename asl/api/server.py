@@ -1,217 +1,164 @@
 """
-FastAPI server for ASL schema management.
+FastAPI server for schema management.
 """
 
-from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+from typing import Dict, List, Optional, Any
 from datetime import datetime
+from fastapi import FastAPI, HTTPException, Query, Depends
+from pydantic import BaseModel, ConfigDict
+import traceback
 
-from ..usi.redis import RedisUSI, SchemaMetadata
+from ..core.registry import SchemaRegistry
 from ..core.delta import SchemaDelta
+from ..core.metadata import SchemaMetadata
 
+app = FastAPI(title="Schema Management API", version="1.0.0")
 
-app = FastAPI(
-    title="Adaptive Schema Layer API",
-    description="API for managing schema evolution in distributed systems",
-    version="0.1.0"
-)
-
+# Create a persistent registry instance
+registry = SchemaRegistry()
 
 class SchemaRegistrationRequest(BaseModel):
     """Request model for schema registration."""
-    schema_name: str
-    version: str
-    delta: SchemaDelta
-    metadata: Optional[SchemaMetadata] = None
-
+    delta: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = None
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class SchemaResponse(BaseModel):
-    """Response model for schema information."""
+    """Response model for schema operations."""
     schema_name: str
     version: str
-    delta: SchemaDelta
-    metadata: Optional[SchemaMetadata]
-
+    delta: Dict[str, Any]
+    metadata: Dict[str, Any]
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class VersionListResponse(BaseModel):
     """Response model for version list."""
     schema_name: str
     versions: List[str]
 
-
 class CompatibilityResponse(BaseModel):
     """Response model for compatibility check."""
-    is_compatible: bool
-    message: str
+    schema_name: str
+    from_version: str
+    to_version: str
+    compatible: bool
 
+class TransformRequest(BaseModel):
+    """Request model for data transformation."""
+    data: Dict[str, Any]
+    from_version: str
+    to_version: str
 
-def get_usi() -> RedisUSI:
-    """Dependency to get RedisUSI instance."""
-    return RedisUSI()
+class TransformResponse(BaseModel):
+    """Response model for data transformation."""
+    schema_name: str
+    from_version: str
+    to_version: str
+    transformed_data: Dict[str, Any]
 
+def get_registry() -> SchemaRegistry:
+    """Get the persistent registry instance."""
+    return registry
 
-@app.post("/schemas", response_model=SchemaResponse)
+@app.post("/schemas/{schema_name}/versions/{version}", response_model=SchemaResponse)
 async def register_schema(
+    schema_name: str,
+    version: str,
     request: SchemaRegistrationRequest,
-    usi: RedisUSI = Depends(get_usi)
+    registry: SchemaRegistry = Depends(get_registry)
 ):
-    """
-    Register a new schema version.
-    
-    Args:
-        request: Schema registration request
-        usi: RedisUSI instance
-        
-    Returns:
-        Registered schema information
-    """
+    """Register a new schema version."""
     try:
-        # If no metadata provided, create default metadata
-        if not request.metadata:
-            request.metadata = SchemaMetadata(
-                created_at=datetime.now().timestamp(),
-                created_by="api",
-                description=f"Schema version {request.version} for {request.schema_name}"
-            )
-            
-        # Register the schema
-        usi.register_schema(
-            request.schema_name,
-            request.version,
-            request.delta,
-            request.metadata
-        )
-        
-        return SchemaResponse(
-            schema_name=request.schema_name,
-            version=request.version,
-            delta=request.delta,
-            metadata=request.metadata
-        )
-        
+        delta = SchemaDelta(**request.delta)
+        metadata = SchemaMetadata(**request.metadata) if request.metadata else None
+        registry.register_delta(schema_name, version, delta, metadata.model_dump() if metadata else None)
+        return {
+            "schema_name": schema_name,
+            "version": version,
+            "delta": delta.model_dump(),
+            "metadata": metadata.model_dump() if metadata else {}
+        }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.get("/schemas/{schema_name}/versions", response_model=VersionListResponse)
 async def get_versions(
     schema_name: str,
-    usi: RedisUSI = Depends(get_usi)
+    registry: SchemaRegistry = Depends(get_registry)
 ):
-    """
-    Get all versions for a schema.
-    
-    Args:
-        schema_name: Name of the schema
-        usi: RedisUSI instance
-        
-    Returns:
-        List of version identifiers
-    """
-    versions = usi.get_versions(schema_name)
-    if not versions:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No versions found for schema {schema_name}"
-        )
-    return VersionListResponse(schema_name=schema_name, versions=list(versions))
-
+    """Get all versions of a schema."""
+    try:
+        versions = registry.get_versions(schema_name)
+        return {
+            "schema_name": schema_name,
+            "versions": list(versions)
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/schemas/{schema_name}/versions/{version}", response_model=SchemaResponse)
 async def get_schema(
     schema_name: str,
     version: str,
-    usi: RedisUSI = Depends(get_usi)
+    registry: SchemaRegistry = Depends(get_registry)
 ):
-    """
-    Get schema information for a specific version.
-    
-    Args:
-        schema_name: Name of the schema
-        version: Version identifier
-        usi: RedisUSI instance
-        
-    Returns:
-        Schema information
-    """
-    delta = usi.get_delta(schema_name, version)
-    if not delta:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Schema {schema_name} version {version} not found"
-        )
-        
-    metadata = usi.get_metadata(schema_name, version)
-    
-    return SchemaResponse(
-        schema_name=schema_name,
-        version=version,
-        delta=delta,
-        metadata=metadata
-    )
-
+    """Get a specific schema version."""
+    try:
+        delta, metadata = registry.get_schema(schema_name, version)
+        return {
+            "schema_name": schema_name,
+            "version": version,
+            "delta": delta.model_dump(),
+            "metadata": metadata if metadata else {}
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/schemas/{schema_name}/compatibility", response_model=CompatibilityResponse)
 async def check_compatibility(
     schema_name: str,
-    version1: str,
-    version2: str,
-    usi: RedisUSI = Depends(get_usi)
+    from_version: str = Query(..., description="Source version"),
+    to_version: str = Query(..., description="Target version"),
+    registry: SchemaRegistry = Depends(get_registry)
 ):
-    """
-    Check compatibility between two schema versions.
-    
-    Args:
-        schema_name: Name of the schema
-        version1: First version
-        version2: Second version
-        usi: RedisUSI instance
-        
-    Returns:
-        Compatibility information
-    """
-    is_compatible = usi.is_compatible(schema_name, version1, version2)
-    message = (
-        f"Schema versions {version1} and {version2} are compatible"
-        if is_compatible
-        else f"Schema versions {version1} and {version2} are not compatible"
-    )
-    
-    return CompatibilityResponse(is_compatible=is_compatible, message=message)
+    """Check compatibility between two schema versions."""
+    try:
+        compatible = registry.check_compatibility(schema_name, from_version, to_version)
+        return {
+            "schema_name": schema_name,
+            "from_version": from_version,
+            "to_version": to_version,
+            "compatible": compatible
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(e))
 
-
-@app.post("/schemas/{schema_name}/transform")
+@app.post("/schemas/{schema_name}/transform", response_model=TransformResponse)
 async def transform_data(
     schema_name: str,
-    from_version: str,
-    to_version: str,
-    data: Dict,
-    usi: RedisUSI = Depends(get_usi)
+    request: TransformRequest,
+    registry: SchemaRegistry = Depends(get_registry)
 ):
-    """
-    Transform data between schema versions.
-    
-    Args:
-        schema_name: Name of the schema
-        from_version: Source version
-        to_version: Target version
-        data: Data to transform
-        usi: RedisUSI instance
-        
-    Returns:
-        Transformed data
-    """
+    """Transform data from one schema version to another."""
     try:
-        # Get the chain of deltas
-        delta_chain = usi.get_delta_chain(schema_name, from_version, to_version)
-        
-        # Apply each delta in sequence
-        result = data
-        for delta in delta_chain:
-            result = delta.apply(result)
-            
-        return result
-        
+        transformed = registry.transform_data(
+            schema_name,
+            request.data,
+            request.from_version,
+            request.to_version
+        )
+        return {
+            "schema_name": schema_name,
+            "from_version": request.from_version,
+            "to_version": request.to_version,
+            "transformed_data": transformed
+        }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(e)) 
